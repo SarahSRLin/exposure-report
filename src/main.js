@@ -23,7 +23,7 @@ const DEFAULTS = {
 let CFG = { ...DEFAULTS };
 async function loadConfig() {
   try {
-    const r = await fetch('config.json?v=' + Date.now(), { cache: 'no-store' });
+    const r = await withTimeout(fetch('config.json?v=' + Date.now(), { cache: 'no-store' }), 5000, '讀取設定');
     if (r.ok) CFG = { ...DEFAULTS, ...(await r.json()) };
   } catch { /* 用預設值 */ }
 }
@@ -40,6 +40,11 @@ const imgSize = (src) => new Promise((res) => { const i = new Image(); i.onload 
 const byName = (fields, name) => name && fields.find((f) => f.name.trim() === String(name).trim());
 
 const state = { busy: false, lastPptx: null, lastName: '' };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function withTimeout(promise, ms, label) {
+  return Promise.race([promise, sleep(ms).then(() => { throw new Error('逾時：' + label); })]);
+}
+function stage(text) { const el = $('#empty'); if (!$('#card').hidden) return; el.hidden = false; el.textContent = text; }
 
 /* ===== 讀取 Lark 資料 ===== */
 async function str(table, field, rid) {
@@ -56,18 +61,40 @@ function linkTableId(v, meta) {
   return arr.find((x) => x?.tableId || x?.table_id)?.tableId || arr.find((x) => x?.table_id)?.table_id || meta?.property?.tableId;
 }
 
+async function readLink(table, linkF, rid) {
+  const tries = [
+    ['方法一', () => table.getCellValue(linkF.id, rid)],
+    ['方法二', async () => (await table.getField(linkF.id)).getValue(rid)],
+    ['方法三', async () => (await table.getRecordById(rid))?.fields?.[linkF.id]],
+  ];
+  const errs = [];
+  for (const [name, fn] of tries) {
+    try {
+      const v = await withTimeout(fn(), 5000, '讀取關聯欄位（' + name + '）');
+      if (linkIds(v).length) { state.linkMethod = name; return v; }
+      errs.push(name + '：沒有讀到關聯記錄');
+    } catch (e) { errs.push(name + '：' + e.message); }
+  }
+  state.linkDebug = errs.join('；');
+  return null;
+}
+
 async function getProject() {
-  const sel = await bitable.base.getSelection();
+  stage('讀取目前選取的位置…');
+  const sel = await withTimeout(bitable.base.getSelection(), 8000, '讀取選取位置');
   if (!sel.tableId || !sel.recordId) return { reason: 'none' };
-  const table = await bitable.base.getTableById(sel.tableId);
-  const fields = await table.getFieldMetaList();
+  stage('讀取表格欄位…');
+  const table = await withTimeout(bitable.base.getTableById(sel.tableId), 8000, '開啟表格');
+  const fields = await withTimeout(table.getFieldMetaList(), 8000, '讀取欄位清單');
   const linkF = byName(fields, CFG['專案表_關聯欄位']);
   if (!linkF) return { reason: 'wrongTable' };
   const titleF = byName(fields, CFG['專案表_標題欄位']) || fields[0];
-  const title = (await str(table, titleF, sel.recordId)) || '未命名專案';
-  const linkVal = await table.getCellValue(linkF.id, sel.recordId).catch(() => null);
+  stage('讀取專案名稱…');
+  const title = (await withTimeout(str(table, titleF, sel.recordId), 8000, '讀取專案名稱').catch(() => '')) || '未命名專案';
+  stage('讀取關聯的曝光需求…');
+  const linkVal = await readLink(table, linkF, sel.recordId);
   const ids = linkIds(linkVal);
-  const expTableId = linkTableId(linkVal, linkF);
+  const expTableId = linkTableId(linkVal, linkF) || (await withTimeout(table.getField(linkF.id).then((f) => f.getMeta()), 8000, '關聯欄位設定').catch(() => null))?.property?.tableId;
   const outF = fields.find((f) => f.type === FieldType.Attachment && f.name.trim() === CFG['專案表_報告存放欄位']);
   return { sel, table, fields, title, ids, expTableId, outF };
 }
@@ -88,7 +115,7 @@ async function readExposures(p, onProgress) {
   };
   const shotsField = F.shots ? await t.getField(F.shots.id) : null;
   const items = []; let skipped = 0; let done = 0;
-  await Promise.all(p.ids.map(async (rid) => {
+  await Promise.all(p.ids.map(async (rid) => withTimeout((async () => {
     const need = F.need ? (await t.getCellValue(F.need.id, rid).catch(() => false)) === true : true;
     const shotVal = F.shots ? await t.getCellValue(F.shots.id, rid).catch(() => null) : null;
     const shotCount = Array.isArray(shotVal) ? shotVal.length : 0;
@@ -100,7 +127,7 @@ async function readExposures(p, onProgress) {
     const links = [...new Set((linkStr.match(URL_RE) || []))];
     items.push({ rid, channel: channel || '未填渠道', timeStr, timeRaw: typeof timeRaw === 'number' ? timeRaw : Infinity, status, note, owner, linkText: linkStr, links, urls, shots: [] });
     onProgress?.(++done, p.ids.length);
-  }));
+  })(), 20000, '讀取曝光需求').catch(() => { skipped++; })));
   items.sort((a, b) => a.channel.localeCompare(b.channel, 'zh-Hant') || a.timeRaw - b.timeRaw);
   return { items, skipped };
 }
@@ -228,8 +255,8 @@ async function refreshPreview() {
     if (p.reason === 'wrongTable') { show('empty', `目前不在專案表。請切到「專案資訊」，點選一個專案。`); return setBusy(false); }
     $('#empty').hidden = true; $('#card').hidden = false;
     $('#rec-title').textContent = p.title;
-    $('#rec-meta').textContent = p.ids.length ? `關聯 ${p.ids.length} 則曝光需求，計算中…` : '這個專案還沒有關聯任何曝光需求';
-    $('#out-hint').textContent = p.outF ? `報告會存到這個專案的「${p.outF.name}」欄位，舊版本會保留。` : `專案表沒有「${CFG['專案表_報告存放欄位']}」附件欄位，報告只會下載到電腦。`;
+    $('#rec-meta').textContent = p.ids.length ? `關聯 ${p.ids.length} 則曝光需求，計算中…` : ('這個專案讀不到關聯的曝光需求' + (state.linkDebug ? `（${state.linkDebug}）` : ''));
+    $('#out-hint').textContent = (p.outF ? `報告會存到這個專案的「${p.outF.name}」欄位，舊版本會保留。` : `專案表沒有「${CFG['專案表_報告存放欄位']}」附件欄位，報告只會下載到電腦。`) + (state.linkMethod && state.linkMethod !== '方法一' ? `（讀取方式：${state.linkMethod}）` : '');
     state.ready = p.ids.length > 0;
     setBusy(false);
     if (p.ids.length) {
@@ -239,7 +266,7 @@ async function refreshPreview() {
       const shot = items.filter((i) => i.urls.length).length;
       $('#rec-meta').textContent = items.length ? `${items.length} 則要截圖的曝光，${shot} 則已有截圖` : '沒有勾選「要截圖」的曝光需求';
     }
-  } catch (e) { console.error(e); setStatus('bad', '讀不到表格資料。請重新整理頁面再試一次。'); }
+  } catch (e) { console.error(e); setStatus('bad', '讀不到表格資料：' + (e?.message || e) + '。請截圖給 Sarah。'); $('#empty').textContent = '讀取失敗'; }
 }
 function show(id, text) { $('#card').hidden = true; $('#empty').hidden = false; $('#empty').textContent = text; $('#out-hint').textContent = ''; }
 
